@@ -1162,7 +1162,7 @@ class EsMetricsStore(DataStreamHandler, MetricsStore):
         self._index_template_provider = index_template_provider_class(cfg)
         self._docs = None
         self._use_data_streams = convert.to_bool(
-            self._config.opts("reporting", cast(types.Key, "datastore.use_data_streams"), default_value=False, mandatory=False)
+            self._config.opts("reporting", cast(types.Key, "datastore.use_data_streams"), default_value=True, mandatory=False)
         )
 
     def open(self, race_id=None, race_timestamp=None, track_name=None, challenge_name=None, car_name=None, ctx=None, create=False):
@@ -2042,7 +2042,7 @@ class EsRaceStore(DataStreamHandler, RaceStore):
         self._index_template_provider = self.index_template_provider
         self.logger = logging.getLogger(__name__)
         self._use_data_streams = convert.to_bool(
-            self.cfg.opts("reporting", cast(types.Key, "datastore.use_data_streams"), default_value=False, mandatory=False)
+            self.cfg.opts("reporting", cast(types.Key, "datastore.use_data_streams"), default_value=True, mandatory=False)
         )
 
     def _lifecycle_policy(self):
@@ -2299,7 +2299,7 @@ class EsResultsStore(DataStreamHandler):
         self._index_template_provider = self.index_template_provider
         self.logger = logging.getLogger(__name__)
         self._use_data_streams = convert.to_bool(
-            self.cfg.opts("reporting", cast(types.Key, "datastore.use_data_streams"), default_value=False, mandatory=False)
+            self.cfg.opts("reporting", cast(types.Key, "datastore.use_data_streams"), default_value=True, mandatory=False)
         )
 
     def _lifecycle_policy(self):

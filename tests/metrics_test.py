@@ -646,6 +646,7 @@ class TestEsMetrics:
         self.cfg = config.Config()
         self.cfg.add(config.Scope.application, "system", "env.name", "unittest")
         self.cfg.add(config.Scope.application, "track", "params", {"shard-count": 3})
+        self.cfg.add(config.Scope.application, "reporting", "datastore.use_data_streams", False)
         self.metrics_store = metrics.EsMetricsStore(
             self.cfg, client_factory_class=MockClientFactory, index_template_provider_class=DummyIndexTemplateProvider, clock=StaticClock
         )
@@ -1617,6 +1618,7 @@ class TestEsRaceStore:
         self.cfg.add(config.Scope.application, "system", "env.name", "unittest-env")
         self.cfg.add(config.Scope.application, "system", "time.start", self.RACE_TIMESTAMP)
         self.cfg.add(config.Scope.application, "system", "race.id", self.RACE_ID)
+        self.cfg.add(config.Scope.application, "reporting", "datastore.use_data_streams", False)
         self.race_store = metrics.EsRaceStore(
             self.cfg,
             client_factory_class=MockClientFactory,
@@ -1865,6 +1867,7 @@ class TestEsResultsStore:
         self.cfg = config.Config()
         self.cfg.add(config.Scope.application, "system", "env.name", "unittest")
         self.cfg.add(config.Scope.application, "system", "time.start", self.RACE_TIMESTAMP)
+        self.cfg.add(config.Scope.application, "reporting", "datastore.use_data_streams", False)
         self.results_store = metrics.EsResultsStore(
             self.cfg,
             client_factory_class=MockClientFactory,
