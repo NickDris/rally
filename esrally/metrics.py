@@ -112,9 +112,12 @@ class EsClient:
 
         self.guarded(elasticsearch.helpers.bulk, self._client, items, index=index, chunk_size=5000)
 
-    def index(self, index, item, id=None):
+    def index(self, index, item, id=None, use_data_streams=True):
         doc = {"_source": item}
-        if id:
+        if use_data_streams:
+            # Data streams only support op_type=create
+            doc["_op_type"] = "create"
+        elif id:
             doc["_id"] = id
         self.bulk_index(index, [doc])
 
@@ -336,7 +339,14 @@ class IndexTemplateProvider:
         self._config = cfg
         self._number_of_shards = self._config.opts("reporting", "datastore.number_of_shards", default_value=None, mandatory=False)
         self._number_of_replicas = self._config.opts("reporting", "datastore.number_of_replicas", default_value=None, mandatory=False)
+        self._use_data_streams = convert.to_bool(
+            self._config.opts("reporting", "datastore.use_data_streams", default_value=True, mandatory=False)
+        )
         self.script_dir = self._config.opts("node", "rally.root")
+
+    @property
+    def use_data_streams(self):
+        return self._use_data_streams
 
     def metrics_template(self):
         return self.index_template("metrics-template")
@@ -408,10 +418,10 @@ class IndexTemplateProvider:
         )
 
     def races_template(self):
-        return self._read("races-template")
+        return self._read("races-ds-template") if self.use_data_streams else self._read("races-template")
 
     def results_template(self):
-        return self._read("results-template")
+        return self._read("results-ds-template") if self.use_data_streams else self._read("results-template")
 
     def annotations_template(self):
         return self._read("annotation-template")
@@ -1121,7 +1131,7 @@ class MetricsStore:
 
 class EsMetricsStore(DataStreamHandler, MetricsStore):
     """
-    A metrics store backed by Elasticsearch.
+    A metrics store for telemetry backed by Elasticsearch.
     """
 
     DATA_STREAM_NAME = "rally-metrics"
@@ -1213,7 +1223,13 @@ class EsMetricsStore(DataStreamHandler, MetricsStore):
         if self._docs:
             sw = time.StopWatch()
             sw.start()
-            self._client.bulk_index(index=self._index, items=self._docs)
+            if self._index_template_provider.use_data_streams:
+                for doc in self._docs:
+                    doc["_op_type"] = "create"
+            self._client.bulk_index(
+                index=self._index,
+                items=self._docs,
+            )
             sw.stop()
             self.logger.info(
                 "Successfully added %d metrics documents for race timestamp=[%s], track=[%s], challenge=[%s], car=[%s] in [%f] seconds.",
@@ -1230,6 +1246,9 @@ class EsMetricsStore(DataStreamHandler, MetricsStore):
             self._client.refresh(index=self._index)
 
     def _add(self, doc):
+        if self._index_template_provider.use_data_streams:
+            # Data streams only support op_type=create
+            doc["_op_type"] = "create"
         self._docs.append(doc)
 
     def _get(self, name, task, operation_type, sample_type, node_name, mapper):
@@ -1719,6 +1738,7 @@ class Race:
         :return: A dict representation suitable for persisting this race instance as JSON.
         """
         d = {
+            "@timestamp": time.to_epoch_millis(self.race_timestamp.timestamp()),
             "rally-version": self.rally_version,
             "rally-revision": self.rally_revision,
             "environment": self.environment_name,
@@ -1758,6 +1778,7 @@ class Race:
         :return: a list of dicts, suitable for persisting the results of this race in a format that is Kibana-friendly.
         """
         result_template = {
+            "@timestamp": time.to_epoch_millis(self.race_timestamp.timestamp()),
             "rally-version": self.rally_version,
             "rally-revision": self.rally_revision,
             "environment": self.environment_name,
