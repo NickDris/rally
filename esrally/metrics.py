@@ -28,6 +28,7 @@ import sys
 import uuid
 import zlib
 from enum import Enum, IntEnum
+from typing import cast
 
 import tabulate
 
@@ -55,6 +56,35 @@ class EsClient:
 
     def template_exists(self, name):
         return self.guarded(self._client.indices.exists_index_template, name=name)
+
+    def get_component_template(self, name):
+        return self.guarded(self._client.cluster.get_component_template, name=name)
+
+    def put_component_template(self, name, template):
+        tmpl = json.loads(template)
+        return self.guarded(self._client.cluster.put_component_template, name=name, **tmpl)
+
+    def component_template_exists(self, name):
+        return self.guarded(self._client.cluster.exists_component_template, name=name)
+
+    def get_lifecycle(self, name):
+        return self.guarded(self._client.ilm.get_lifecycle, name=name)
+
+    def put_lifecycle(self, name, policy):
+        ilm_policy = json.loads(policy)
+        return self.guarded(self._client.ilm.put_lifecycle, name=name, **ilm_policy)
+
+    def lifecycle_exists(self, name):
+        # pylint: disable=import-outside-toplevel
+        from elastic_transport import ApiError
+
+        try:
+            self._client.ilm.get_lifecycle(name=name)
+            return True
+        except ApiError as e:
+            if getattr(e, "status_code", None) == 404:
+                return False
+            raise
 
     def delete_by_query(self, index, body):
         return self.guarded(self._client.delete_by_query, index=index, body=body)
@@ -301,6 +331,10 @@ class IndexTemplateProvider:
     Abstracts how the Rally index template is retrieved. Intended for testing.
     """
 
+    COMPONENT_TEMPLATE_MAPPING_SUFFIX = "-mapping"
+    COMPONENT_TEMPLATE_LIFECYCLE_DEFAULT_SUFFIX = "-lifecycle-default"
+    COMPONENT_TEMPLATE_CUSTOM_SUFFIX = "@custom"
+
     def __init__(self, cfg: types.Config):
         self._config = cfg
         self._number_of_shards = self._config.opts("reporting", "datastore.number_of_shards", default_value=None, mandatory=False)
@@ -315,7 +349,73 @@ class IndexTemplateProvider:
         return self._use_data_streams
 
     def metrics_template(self):
-        return self._read("metrics-ds-template") if self.use_data_streams else self._read("metrics-template")
+        return self.index_template("metrics-template")
+
+    def index_template(self, template_name):
+        return json.dumps(self._load(template_name))
+
+    @classmethod
+    def component_template_name(cls, name, suffix):
+        return f"{name}{suffix}"
+
+    def data_stream_component_templates(self, name, template_name, lifecycle_policy_name):
+        template = self._load(template_name)["template"]
+
+        return {
+            self.component_template_name(name, self.COMPONENT_TEMPLATE_MAPPING_SUFFIX): json.dumps(
+                {"template": {"mappings": template["mappings"]}}
+            ),
+            self.component_template_name(name, self.COMPONENT_TEMPLATE_LIFECYCLE_DEFAULT_SUFFIX): json.dumps(
+                {
+                    "template": {
+                        "settings": {
+                            "index": {
+                                **template.get("settings", {}).get("index", {}),
+                                "lifecycle": {"name": lifecycle_policy_name},
+                            }
+                        }
+                    }
+                }
+            ),
+            self.component_template_name(name, self.COMPONENT_TEMPLATE_CUSTOM_SUFFIX): json.dumps({"template": {}}),
+        }
+
+    def data_stream_template(self, name, priority):
+        return json.dumps(
+            {
+                "index_patterns": [f"{name}*"],
+                "data_stream": {},
+                "composed_of": [
+                    self.component_template_name(name, self.COMPONENT_TEMPLATE_MAPPING_SUFFIX),
+                    self.component_template_name(name, self.COMPONENT_TEMPLATE_LIFECYCLE_DEFAULT_SUFFIX),
+                    self.component_template_name(name, self.COMPONENT_TEMPLATE_CUSTOM_SUFFIX),
+                ],
+                "priority": priority,
+            }
+        )
+
+    def data_stream_lifecycle_policy(self):
+        return json.dumps(
+            {
+                "policy": {
+                    "phases": {
+                        "hot": {"actions": {"rollover": {"max_primary_shard_size": "40gb", "max_age": "30d"}}},
+                        "delete": {"min_age": "180d", "actions": {"delete": {}}},
+                    }
+                }
+            }
+        )
+
+    def data_stream_lifecycle_policy_rollover_only(self):
+        return json.dumps(
+            {
+                "policy": {
+                    "phases": {
+                        "hot": {"actions": {"rollover": {"max_primary_shard_size": "40gb"}}},
+                    }
+                }
+            }
+        )
 
     def races_template(self):
         return self._read("races-ds-template") if self.use_data_streams else self._read("races-template")
@@ -327,6 +427,9 @@ class IndexTemplateProvider:
         return self._read("annotation-template")
 
     def _read(self, template_name):
+        return json.dumps(self._load(template_name))
+
+    def _load(self, template_name):
         with open("%s/resources/%s.json" % (self.script_dir, template_name), encoding="utf-8") as f:
             template = json.load(f)
             if self._number_of_shards is not None:
@@ -338,7 +441,144 @@ class IndexTemplateProvider:
                 template["template"]["settings"]["index"]["number_of_shards"] = int(self._number_of_shards)
             if self._number_of_replicas is not None:
                 template["template"]["settings"]["index"]["number_of_replicas"] = int(self._number_of_replicas)
-            return json.dumps(template)
+            return template
+
+
+class DataStreamHandler:
+    """
+    Mixin providing composable index template and lifecycle policy management for data streams.
+
+    Subclasses must define class attributes:
+        DATA_STREAM_NAME: str
+        TEMPLATE_RESOURCE_NAME: str
+        DATA_STREAM_TEMPLATE_PRIORITY: int
+        LIFECYCLE_POLICY_SUFFIX: str
+
+    And have available as instance attributes:
+        self._client: EsClient
+        self._index_template_provider: IndexTemplateProvider
+        self.logger: logging.Logger
+        self._config: types.Config
+
+    Throws error if a subclass does not define the required class attributes.
+    """
+
+    REQUIRED_CLASS_ATTRS = ("DATA_STREAM_NAME", "TEMPLATE_RESOURCE_NAME", "DATA_STREAM_TEMPLATE_PRIORITY", "LIFECYCLE_POLICY_SUFFIX")
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        for attr in DataStreamHandler.REQUIRED_CLASS_ATTRS:
+            if not hasattr(cls, attr):
+                raise TypeError(f"{cls.__name__} must define class attribute '{attr}' (required by DataStreamHandler)")
+
+    @property
+    def _overwrite_templates(self):
+        return convert.to_bool(
+            self._config.opts(section="reporting", key="datastore.overwrite_existing_templates", default_value=False, mandatory=False)
+        )
+
+    def _should_apply_update(self, resource_label, old_resource, new_resource):
+        """Returns True if the resource should be written, False to skip."""
+        if old_resource is None:
+            self.logger.info("Create %s:\n%s", resource_label, pretty.dump(new_resource, pretty.Flag.FLAT_DICT))
+            return True
+
+        diff = pretty.diff(old_resource, new_resource, pretty.Flag.FLAT_DICT)
+        if diff == "":
+            self.logger.debug("Keep existing %s (it is identical)", resource_label)
+            return False
+        if not self._overwrite_templates:
+            self.logger.debug("Keep existing %s (datastore.overwrite_existing_templates = false):\n%s", resource_label, diff)
+            return False
+
+        self.logger.warning("Overwrite existing %s (datastore.overwrite_existing_templates = true):\n%s", resource_label, diff)
+        return True
+
+    def _lifecycle_policy(self):
+        """Returns the lifecycle policy JSON string for this store. Override in subclasses."""
+        return self._index_template_provider.data_stream_lifecycle_policy()
+
+    def _ensure_data_stream_template(self):
+        self._ensure_lifecycle_policy(
+            self.default_lifecycle_policy_name(),
+            self._lifecycle_policy(),
+        )
+
+        for name, template in self._index_template_provider.data_stream_component_templates(
+            self.index_template_name(),
+            self.TEMPLATE_RESOURCE_NAME,
+            self.default_lifecycle_policy_name(),
+        ).items():
+            self._ensure_component_template(name, template, overwrite=name != self.custom_component_template_name())
+
+        self._ensure_data_stream_index_template(
+            self._index_template_provider.data_stream_template(self.index_template_name(), self.DATA_STREAM_TEMPLATE_PRIORITY)
+        )
+
+    def _ensure_lifecycle_policy(self, name, policy):
+        new_policy_body = json.loads(policy).get("policy", {})
+
+        old_policy = None
+        if self._client.lifecycle_exists(name):
+            old_policy = self._client.get_lifecycle(name).body.get(name, {}).get("policy", {})
+
+        if self._should_apply_update(f"lifecycle policy [{name}]", old_policy, new_policy_body):
+            self._client.put_lifecycle(name, policy)
+
+    def _ensure_component_template(self, name, template, overwrite):
+        new_template_body = json.loads(template).get("template", {})
+
+        old_template_body = None
+        if self._client.component_template_exists(name):
+            if not overwrite:
+                self.logger.debug("Keep existing component template [%s] (reserved for user overrides).", name)
+                return
+
+            for existing in self._client.get_component_template(name).body.get("component_templates", []):
+                old_template_body = existing.get("component_template", {}).get("template", {})
+                break
+
+        if self._should_apply_update(f"component template [{name}]", old_template_body, new_template_body):
+            self._client.put_component_template(name, template)
+
+    def _ensure_data_stream_index_template(self, template):
+        new_template = json.loads(template)
+
+        old_template = None
+        if self._client.template_exists(self.index_template_name()):
+            for existing in self._client.get_template(self.index_template_name()).body.get("index_templates", []):
+                old_template = existing.get("index_template", {})
+                break
+
+        if self._should_apply_update("index template", old_template, new_template):
+            self._client.put_template(self.index_template_name(), template)
+
+    @classmethod
+    def data_stream_name(cls):
+        return cls.DATA_STREAM_NAME
+
+    @classmethod
+    def index_template_name(cls):
+        return cls.DATA_STREAM_NAME
+
+    @classmethod
+    def mapping_component_template_name(cls):
+        return IndexTemplateProvider.component_template_name(cls.index_template_name(), IndexTemplateProvider.COMPONENT_TEMPLATE_MAPPING_SUFFIX)
+
+    @classmethod
+    def lifecycle_component_template_name(cls):
+        return IndexTemplateProvider.component_template_name(
+            cls.index_template_name(), IndexTemplateProvider.COMPONENT_TEMPLATE_LIFECYCLE_DEFAULT_SUFFIX
+        )
+
+    @classmethod
+    def custom_component_template_name(cls):
+        return IndexTemplateProvider.component_template_name(cls.index_template_name(), IndexTemplateProvider.COMPONENT_TEMPLATE_CUSTOM_SUFFIX)
+
+    @classmethod
+    def default_lifecycle_policy_name(cls):
+        return f"{cls.index_template_name()}{cls.LIFECYCLE_POLICY_SUFFIX}"
+
 
 
 class MetaInfoScope(Enum):
@@ -903,13 +1143,15 @@ class MetricsStore:
         return stats["avg"] if stats else None
 
 
-class EsMetricsStore(MetricsStore):
+class EsMetricsStore(DataStreamHandler, MetricsStore):
     """
     A metrics store for telemetry backed by Elasticsearch.
     """
 
-    INDEX_PREFIX = "rally-metrics-"
-    DATA_STREAM_VERSIONED = "rally-metrics-v1"
+    DATA_STREAM_NAME = "rally-metrics"
+    TEMPLATE_RESOURCE_NAME = "metrics-template"
+    DATA_STREAM_TEMPLATE_PRIORITY = 500
+    LIFECYCLE_POLICY_SUFFIX = "-default"
 
     def __init__(
         self,
@@ -933,6 +1175,9 @@ class EsMetricsStore(MetricsStore):
         self._client = client_factory_class(cfg).create()
         self._index_template_provider = index_template_provider_class(cfg)
         self._docs = None
+        self._use_data_streams = convert.to_bool(
+            self._config.opts("reporting", cast(types.Key, "datastore.use_data_streams"), default_value=True, mandatory=False)
+        )
 
     def open(self, race_id=None, race_timestamp=None, track_name=None, challenge_name=None, car_name=None, ctx=None, create=False):
         self._docs = []
@@ -940,67 +1185,55 @@ class EsMetricsStore(MetricsStore):
         self._index = self.index_name()
         # reduce a bit of noise in the metrics cluster log
         if create:
-            self._ensure_index_template()
-            # Data streams are created implicitly on first write
-            if not self._index_template_provider.use_data_streams:
-                # We want to create the index if it does not exist.
+            if self._use_data_streams:
+                self._ensure_data_stream_template()
+            else:
+                self._ensure_index_template()
                 if not self._client.exists(index=self._index):
                     self._client.create_index(index=self._index)
                 else:
                     self.logger.info("[%s] already exists.", self._index)
         else:
             # we still need to check for the correct index name - prefer the one with the suffix
-            new_name = self._migrated_index_name(self._index)
-            if self._client.exists(index=new_name):
-                self._index = new_name
+            if not self._use_data_streams:
+                new_name = self._migrated_index_name(self._index)
+                if self._client.exists(index=new_name):
+                    self._index = new_name
 
-        # Skip refresh when creating with data streams - the data stream won't exist until first write
-        if not self._index_template_provider.use_data_streams:
-            # ensure we can search immediately after opening
+        # ensure we can search immediately after opening
+        if self._use_data_streams:
+            if not create and self._client.exists(index=self._index):
+                self._client.refresh(index=self._index)
+        else:
             self._client.refresh(index=self._index)
 
     def _ensure_index_template(self):
-        new_template: str = self._get_template()
-        old_template: dict | None = None
-        # We are adding -ds suffix to ensure backwards compatibility with existing index templates
-        target_index_template_name = "rally-metrics-ds" if self._index_template_provider.use_data_streams else "rally-metrics"
-        if self._client.template_exists(target_index_template_name):
-            for t in self._client.get_template(target_index_template_name).body.get("index_templates", []):
+        new_template_str = self._get_template()
+        new_template_body = json.loads(new_template_str).get("template", {})
+
+        old_template = None
+        if self._client.template_exists(self.index_template_name()):
+            for t in self._client.get_template(self.index_template_name()).body.get("index_templates", []):
                 old_template = t.get("index_template", {}).get("template", {})
                 break
 
-        if old_template is None:
-            self.logger.info(
-                "Create index template:\n%s",
-                pretty.dump(json.loads(new_template).get("template", {}), pretty.Flag.FLAT_DICT),
-            )
-        else:
-            diff = pretty.diff(old_template, json.loads(new_template).get("template", {}), pretty.Flag.FLAT_DICT)
-            if diff == "":
-                self.logger.debug("Keep existing template (it is identical)")
-                return
-            if not convert.to_bool(
-                self._config.opts(section="reporting", key="datastore.overwrite_existing_templates", default_value=False, mandatory=False)
-            ):
-                self.logger.debug("Keep existing template (datastore.overwrite_existing_templates = false):\n%s", diff)
-                return
-            self.logger.warning("Overwrite existing index template (datastore.overwrite_existing_templates = true):\n%s", diff)
-
-        self._client.put_template(target_index_template_name, new_template)
+        if self._should_apply_update("index template", old_template, new_template_body):
+            self._client.put_template(self.index_template_name(), new_template_str)
 
     def index_name(self):
-        if self._index_template_provider.use_data_streams:
-            return f"{EsMetricsStore.DATA_STREAM_VERSIONED}"
+        if self._use_data_streams:
+            return self.data_stream_name()
         ts = time.from_iso8601(self._race_timestamp)
-        return f"{EsMetricsStore.INDEX_PREFIX}{ts.year:04d}-{ts.month:02d}"
+        return f"{self.index_template_name()}-{ts.year:04d}-{ts.month:02d}"
 
     def _migrated_index_name(self, original_name):
         return f"{original_name}.new"
 
     def _get_template(self):
-        return self._index_template_provider.metrics_template()
+        return self._index_template_provider.index_template(self.TEMPLATE_RESOURCE_NAME)
 
     def flush(self, refresh=True):
+        wrote_docs = bool(self._docs)
         if self._docs:
             sw = time.StopWatch()
             sw.start()
@@ -1023,7 +1256,7 @@ class EsMetricsStore(MetricsStore):
             )
         self._docs = []
         # ensure we can search immediately after flushing
-        if refresh:
+        if refresh and (not self._use_data_streams or wrote_docs or self._client.exists(index=self._index)):
             self._client.refresh(index=self._index)
 
     def _add(self, doc):
@@ -1046,6 +1279,12 @@ class EsMetricsStore(MetricsStore):
             self.logger.warning("Metrics query returned [%d] out of [%s] matching docs.", len(result["hits"]["hits"]), es_count)
         return [mapper(v["_source"]) for v in result["hits"]["hits"]]
 
+    @staticmethod
+    def _hit_count(result):
+        """Extracts total hit count, compatible with Elasticsearch 7.0+."""
+        hits = result["hits"]["total"]
+        return hits["value"] if isinstance(hits, dict) else hits
+
     def get_one(
         self, name, sample_type=None, node_name=None, task=None, mapper=lambda doc: doc["value"], sort_key=None, sort_reverse=False
     ):
@@ -1058,15 +1297,11 @@ class EsMetricsStore(MetricsStore):
             query["sort"] = [{sort_key: {"order": order}}]
         self.logger.debug("Issuing get against index=[%s], query=[%s].", self._index, query)
         result = self._client.search(index=self._index, body=query)
-        hits = result["hits"]["total"]
-        # Elasticsearch 7.0+
-        if isinstance(hits, dict):
-            hits = hits["value"]
+        hits = self._hit_count(result)
         self.logger.debug("Metrics query produced [%s] results.", hits)
         if hits > 0:
             return mapper(result["hits"]["hits"][0]["_source"])
-        else:
-            return None
+        return None
 
     def get_error_rate(self, task, operation_type=None, sample_type=None):
         query = {
@@ -1143,67 +1378,27 @@ class EsMetricsStore(MetricsStore):
         }
         self.logger.debug("Issuing get_percentiles against index=[%s], query=[%s]", self._index, query)
         result = self._client.search(index=self._index, body=query)
-        hits = result["hits"]["total"]
-        # Elasticsearch 7.0+
-        if isinstance(hits, dict):
-            hits = hits["value"]
+        hits = self._hit_count(result)
         self.logger.debug("get_percentiles produced %d hits", hits)
         if hits > 0:
             raw = result["aggregations"]["percentile_stats"]["values"]
             return collections.OrderedDict(sorted(raw.items(), key=lambda t: float(t[0])))
-        else:
-            return None
+        return None
 
     def _query_by_name(self, name, task, operation_type, sample_type, node_name):
-        q = {
-            "bool": {
-                "filter": [
-                    {
-                        "term": {
-                            "race-id": self._race_id,
-                        },
-                    },
-                    {
-                        "term": {
-                            "name": name,
-                        },
-                    },
-                ],
-            },
-        }
+        filters = [
+            {"term": {"race-id": self._race_id}},
+            {"term": {"name": name}},
+        ]
         if task:
-            q["bool"]["filter"].append(
-                {
-                    "term": {
-                        "task": task,
-                    },
-                },
-            )
+            filters.append({"term": {"task": task}})
         if operation_type:
-            q["bool"]["filter"].append(
-                {
-                    "term": {
-                        "operation-type": operation_type,
-                    },
-                },
-            )
+            filters.append({"term": {"operation-type": operation_type}})
         if sample_type:
-            q["bool"]["filter"].append(
-                {
-                    "term": {
-                        "sample-type": sample_type.name.lower(),
-                    },
-                },
-            )
+            filters.append({"term": {"sample-type": sample_type.name.lower()}})
         if node_name:
-            q["bool"]["filter"].append(
-                {
-                    "term": {
-                        "meta.node_name": node_name,
-                    },
-                },
-            )
-        return q
+            filters.append({"term": {"meta.node_name": node_name}})
+        return {"bool": {"filter": filters}}
 
     def to_externalizable(self, clear=False):
         # no need for an externalizable representation - stores everything directly
@@ -1852,40 +2047,46 @@ class FileRaceStore(RaceStore):
         return sorted(races, key=lambda r: r.race_timestamp, reverse=True)
 
 
-class EsRaceStore(RaceStore):
-    """
-    A metric store for race information backed by Elasticsearch.
-    """
-
+class EsRaceStore(DataStreamHandler, RaceStore):
     INDEX_PREFIX = "rally-races-"
-    DATA_STREAM_VERSIONED = "rally-races-v1"
+    DATA_STREAM_NAME = "rally-races"
+    TEMPLATE_RESOURCE_NAME = "races-template"
+    DATA_STREAM_TEMPLATE_PRIORITY = 500
+    LIFECYCLE_POLICY_SUFFIX = "-default"
 
     def __init__(self, cfg: types.Config, client_factory_class=EsClientFactory, index_template_provider_class=IndexTemplateProvider):
         """
-        Creates a new metrics store.
+        Creates a new race store.
 
         :param cfg: The config object. Mandatory.
         :param client_factory_class: This parameter is optional and needed for testing.
         :param index_template_provider_class: This parameter is optional and needed for testing.
         """
         super().__init__(cfg)
+        self._config = cfg
         self.client = client_factory_class(cfg).create()
+        self._client = self.client
         self.index_template_provider = index_template_provider_class(cfg)
+        self._index_template_provider = self.index_template_provider
+        self.logger = logging.getLogger(__name__)
+        self._use_data_streams = convert.to_bool(
+            self.cfg.opts("reporting", cast(types.Key, "datastore.use_data_streams"), default_value=True, mandatory=False)
+        )
+
+    def _lifecycle_policy(self):
+        return self._index_template_provider.data_stream_lifecycle_policy_rollover_only()
 
     def store_race(self, race):
         doc = race.as_dict()
-        # always update the mapping to the latest version
-        self.client.put_template("rally-races", self.index_template_provider.races_template())
-        self.client.index(
-            index=self.index_name(race),
-            item=doc,
-            id=race.race_id,
-            use_data_streams=self.index_template_provider.use_data_streams,
-        )
+        if self._use_data_streams:
+            self._ensure_data_stream_template()
+        else:
+            self.client.put_template("rally-races", self.index_template_provider.races_template())
+        self.client.index(index=self.index_name(race), item=doc, id=race.race_id)
 
-    def index_name(self, race):
-        if self.index_template_provider.use_data_streams:
-            return EsRaceStore.DATA_STREAM_VERSIONED
+    def index_name(self, race=None):
+        if self._use_data_streams:
+            return self.data_stream_name()
         race_timestamp = race.race_timestamp
         return f"{EsRaceStore.INDEX_PREFIX}{race_timestamp:%Y-%m}"
 
@@ -2005,11 +2206,14 @@ class EsRaceStore(RaceStore):
             else:
                 console.println(f"Would delete {len(races)} races: {races} in environment {environment}.")
         else:
+            metrics_index = EsMetricsStore.data_stream_name() if self._use_data_streams else "rally-metrics-*"
+            races_index = EsRaceStore.data_stream_name() if self._use_data_streams else "rally-races-*"
+            results_index = EsResultsStore.data_stream_name() if self._use_data_streams else "rally-results-*"
             for race_id in races:
                 selector = {"query": {"bool": {"filter": [{"term": {"environment": environment}}, {"term": {"race-id": race_id}}]}}}
-                self.client.delete_by_query(index="rally-races-*", body=selector)
-                self.client.delete_by_query(index="rally-metrics-*", body=selector)
-                result = self.client.delete_by_query(index="rally-results-*", body=selector)
+                self.client.delete_by_query(index=races_index, body=selector)
+                self.client.delete_by_query(index=metrics_index, body=selector)
+                result = self.client.delete_by_query(index=results_index, body=selector)
                 if result["deleted"] > 0:
                     console.println(f"Successfully deleted [{race_id}] in environment [{environment}].")
                 else:
@@ -2057,7 +2261,8 @@ class EsRaceStore(RaceStore):
             query["query"]["bool"]["filter"].append({"term": {"challenge": challenge}})
         if user_tags:
             query["query"]["bool"]["filter"].extend([{"term": {f"user-tags.{k}": v}} for k, v in user_tags.items()])
-        result = self.client.search(index="%s*" % EsRaceStore.INDEX_PREFIX, body=query)
+        search_index = self.data_stream_name() if self._use_data_streams else "%s*" % EsRaceStore.INDEX_PREFIX
+        result = self.client.search(index=search_index, body=query)
         hits = result["hits"]["total"]
         # Elasticsearch 7.0+
         if isinstance(hits, dict):
@@ -2081,7 +2286,8 @@ class EsRaceStore(RaceStore):
                 },
             },
         }
-        result = self.client.search(index="%s*" % EsRaceStore.INDEX_PREFIX, body=query)
+        search_index = self.data_stream_name() if self._use_data_streams else "%s*" % EsRaceStore.INDEX_PREFIX
+        result = self.client.search(index=search_index, body=query)
         hits = result["hits"]["total"]
         # Elasticsearch 7.0+
         if isinstance(hits, dict):
@@ -2094,13 +2300,16 @@ class EsRaceStore(RaceStore):
             raise exceptions.NotFound(f"No race with race id [{race_id}]")
 
 
-class EsResultsStore:
+class EsResultsStore(DataStreamHandler):
     """
     Stores the results of a race in a format that is better suited for reporting with Kibana.
     """
 
     INDEX_PREFIX = "rally-results-"
-    DATA_STREAM_VERSIONED = "rally-results-v1"
+    DATA_STREAM_NAME = "rally-results"
+    TEMPLATE_RESOURCE_NAME = "results-template"
+    DATA_STREAM_TEMPLATE_PRIORITY = 500
+    LIFECYCLE_POLICY_SUFFIX = "-default"
 
     def __init__(self, cfg: types.Config, client_factory_class=EsClientFactory, index_template_provider_class=IndexTemplateProvider):
         """
@@ -2111,24 +2320,29 @@ class EsResultsStore:
         :param index_template_provider_class: This parameter is optional and needed for testing.
         """
         self.cfg = cfg
+        self._config = cfg
         self.client = client_factory_class(cfg).create()
+        self._client = self.client
         self.index_template_provider = index_template_provider_class(cfg)
-
-    def store_results(self, race):
-        # always update the mapping to the latest version
-        self.client.put_template("rally-results", self.index_template_provider.results_template())
-        items = race.to_result_dicts()
-        if self.index_template_provider.use_data_streams:
-            for item in items:
-                item["_op_type"] = "create"
-        self.client.bulk_index(
-            index=self.index_name(race),
-            items=items,
+        self._index_template_provider = self.index_template_provider
+        self.logger = logging.getLogger(__name__)
+        self._use_data_streams = convert.to_bool(
+            self.cfg.opts("reporting", cast(types.Key, "datastore.use_data_streams"), default_value=True, mandatory=False)
         )
 
-    def index_name(self, race):
-        if self.index_template_provider.use_data_streams:
-            return EsResultsStore.DATA_STREAM_VERSIONED
+    def _lifecycle_policy(self):
+        return self._index_template_provider.data_stream_lifecycle_policy_rollover_only()
+
+    def store_results(self, race):
+        if self._use_data_streams:
+            self._ensure_data_stream_template()
+        else:
+            self.client.put_template("rally-results", self.index_template_provider.results_template())
+        self.client.bulk_index(index=self.index_name(race), items=race.to_result_dicts())
+
+    def index_name(self, race=None):
+        if self._use_data_streams:
+            return self.data_stream_name()
         race_timestamp = race.race_timestamp
         return f"{EsResultsStore.INDEX_PREFIX}{race_timestamp:%Y-%m}"
 
